@@ -5,6 +5,7 @@ from .petr import (
     PETRHead,
     HungarianMatcher,
     SETCriterion,
+    CameraAwarePositionEmbedding3D,
     SimplePositionEmbedding3D,
     build_model,
 )
@@ -15,6 +16,7 @@ __all__ = [
     "PETRHead",
     "HungarianMatcher",
     "SETCriterion",
+    "CameraAwarePositionEmbedding3D",
     "SimplePositionEmbedding3D",
     "build_model",
 ]

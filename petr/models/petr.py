@@ -11,7 +11,6 @@ Key innovations:
 """
 from __future__ import annotations
 
-import math
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -84,6 +83,81 @@ class SinCosPositionEmbedding(nn.Module):
         pos_y = torch.stack((pos_y[..., 0::2].sin(), pos_y[..., 1::2].cos()), dim=-1).flatten(-2)
         pos = torch.cat((pos_y, pos_x), dim=-1)
         return pos.permute(0, 3, 1, 2).contiguous()
+
+
+class CameraAwarePositionEmbedding3D(nn.Module):
+    """
+    Camera-aware 3D position embedding.
+
+    This approximates PETR's idea of lifting each image location to 3D points
+    across multiple depth bins and encoding these coordinates.
+    """
+
+    def __init__(
+        self,
+        d_model: int = 256,
+        num_depth_bins: int = 8,
+        depth_start: float = 1.0,
+        depth_end: float = 50.0,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_depth_bins = num_depth_bins
+        self.depth_start = depth_start
+        self.depth_end = depth_end
+
+        self.encoder = nn.Sequential(
+            nn.Linear(3 * num_depth_bins, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+        )
+
+    def forward(
+        self,
+        feat: torch.Tensor,  # (B, V, C, H, W)
+        cam_intrinsics: torch.Tensor,  # (B, V, 3, 3)
+        cam_extrinsics: torch.Tensor,  # (B, V, 4, 4), world -> cam
+        image_size: Tuple[int, int],  # (H_img, W_img)
+    ) -> torch.Tensor:
+        B, V, _, H, W = feat.shape
+        image_h, image_w = image_size
+        device = feat.device
+        dtype = feat.dtype
+
+        if cam_intrinsics.shape[:2] != (B, V) or cam_extrinsics.shape[:2] != (B, V):
+            raise ValueError("Camera tensor batch/view dims must match image batch/view dims.")
+
+        grid_y, grid_x = torch.meshgrid(
+            (torch.arange(H, device=device, dtype=dtype) + 0.5) * (float(image_h) / float(H)),
+            (torch.arange(W, device=device, dtype=dtype) + 0.5) * (float(image_w) / float(W)),
+            indexing="ij",
+        )
+        ones = torch.ones_like(grid_x)
+        pixel_homo = torch.stack((grid_x, grid_y, ones), dim=-1).view(1, 1, H * W, 3)
+        pixel_homo = pixel_homo.expand(B, V, -1, -1)  # (B, V, H*W, 3)
+
+        k_inv = torch.inverse(cam_intrinsics)  # (B, V, 3, 3)
+        rays_cam = torch.einsum("bvij,bvpj->bvpi", k_inv, pixel_homo)  # (B, V, H*W, 3)
+
+        depth_bins = torch.linspace(
+            self.depth_start,
+            self.depth_end,
+            self.num_depth_bins,
+            device=device,
+            dtype=dtype,
+        ).view(1, 1, 1, self.num_depth_bins, 1)
+        points_cam = rays_cam.unsqueeze(-2) * depth_bins  # (B, V, H*W, D, 3)
+
+        rotation = cam_extrinsics[:, :, :3, :3]
+        translation = cam_extrinsics[:, :, :3, 3].unsqueeze(2).unsqueeze(2)
+
+        # x_cam = R @ x_world + t  ->  x_world(row) = (x_cam(row) - t(row)) @ R
+        points_world = torch.einsum("bvpdj,bvjk->bvpdk", points_cam - translation, rotation)
+        points_world = (points_world / max(self.depth_end, 1e-6)).clamp(min=-2.0, max=2.0)
+
+        points_world = points_world.flatten(-2)  # (B, V, H*W, D*3)
+        pos_3d = self.encoder(points_world)  # (B, V, H*W, d_model)
+        return pos_3d.view(B, V * H * W, self.d_model)
 
 
 class SimplePositionEmbedding3D(nn.Module):
@@ -497,7 +571,8 @@ class PETR(nn.Module):
         self.input_proj = nn.Conv2d(backbone_channels, d_model, kernel_size=1)
 
         # Position embeddings
-        self.pos_3d = SimplePositionEmbedding3D(d_model=d_model, num_views=num_views)
+        self.pos_3d = CameraAwarePositionEmbedding3D(d_model=d_model)
+        self.pos_3d_simple = SimplePositionEmbedding3D(d_model=d_model, num_views=num_views)
 
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -526,8 +601,8 @@ class PETR(nn.Module):
         self.head = PETRHead(d_model, num_classes, num_queries)
 
         # Loss criterion
-        self.matcher = HungarianMatcher(cost_class=1.0, cost_bbox=5.0, cost_giou=2.0)
-        self.criterion = SETCriterion(num_classes, self.matcher)
+        self.matcher = HungarianMatcher(cost_class=1.0, cost_bbox=5.0, cost_giou=0.0)
+        self.criterion = SETCriterion(num_classes, self.matcher, weight_giou=0.0)
 
         self._reset_parameters()
 
@@ -547,8 +622,8 @@ class PETR(nn.Module):
 
         Args:
             images: Multi-view images (B, V, 3, H, W)
-            cam_intrinsics: Camera intrinsics (B, V, 3, 3) - optional for 3D PE
-            cam_extrinsics: Camera extrinsics (B, V, 4, 4) - optional for 3D PE
+            cam_intrinsics: Camera intrinsics (B, V, 3, 3), required when with_3d_pe=True
+            cam_extrinsics: Camera extrinsics (B, V, 4, 4), required when with_3d_pe=True
 
         Returns:
             dict with keys:
@@ -568,7 +643,17 @@ class PETR(nn.Module):
         feats = feats.view(B, V, C, h, w)
 
         # Get 3D position embeddings
-        pos_3d = self.pos_3d(feats)  # (B, V*h*w, d_model)
+        if self.with_3d_pe:
+            if cam_intrinsics is None or cam_extrinsics is None:
+                raise ValueError("cam_intrinsics and cam_extrinsics are required when with_3d_pe=True.")
+            pos_3d = self.pos_3d(
+                feats,
+                cam_intrinsics=cam_intrinsics,
+                cam_extrinsics=cam_extrinsics,
+                image_size=(H, W),
+            )
+        else:
+            pos_3d = self.pos_3d_simple(feats)
 
         # Flatten spatial dimensions
         src = feats.permute(0, 1, 3, 4, 2).reshape(B, V * h * w, C)  # (B, V*h*w, d_model)
@@ -677,7 +762,12 @@ class PETRLite(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        images: torch.Tensor,
+        cam_intrinsics: Optional[torch.Tensor] = None,
+        cam_extrinsics: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         b, v, _, _, _ = images.shape
         x = images.flatten(0, 1)
         feats = self.backbone(x)
@@ -709,7 +799,7 @@ class PETRLite(nn.Module):
         }
 
 
-def build_model(cfg: Dict) -> PETRLite:
+def build_model(cfg: Dict) -> nn.Module:
     """Build PETR model from config."""
     model_cfg = cfg["model"]
     data_cfg = cfg["data"]
