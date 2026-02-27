@@ -1,0 +1,15 @@
+name: petr-ddp-cpu
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch=2.2
+  - torchvision
+  - torchaudio
+  - cpuonly
+  - numpy<2
+  - pyyaml
+  - pytest
+  - pip

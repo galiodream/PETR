@@ -1,0 +1,16 @@
+name: petr-ddp-cu118
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch=2.2
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=11.8
+  - numpy<2
+  - pyyaml
+  - pytest
+  - pip

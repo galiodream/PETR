@@ -1,0 +1,30 @@
+model:
+  d_model: 64
+  nhead: 4
+  num_encoder_layers: 1
+  num_decoder_layers: 1
+  dim_feedforward: 128
+  dropout: 0.1
+  num_queries: 12
+  num_classes: 5
+  backbone_channels: 64
+
+data:
+  image_size: [64, 64]
+  num_views: 3
+  train_samples: 20
+  val_samples: 8
+  num_workers: 0
+  seed: 7
+
+train:
+  batch_size: 2
+  epochs: 2
+  lr: 0.0005
+  weight_decay: 0.0001
+  clip_max_norm: 0.1
+  log_interval: 1
+  eval_interval: 1
+  save_interval: 1
+  bbox_loss_weight: 2.0
+  amp: false

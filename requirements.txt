@@ -1,0 +1,6 @@
+numpy>=1.23,<2
+PyYAML>=6.0
+pytest>=7.0
+torch>=2.2
+torchvision>=0.17
+torchaudio>=2.2
