@@ -86,121 +86,6 @@ class SinCosPositionEmbedding(nn.Module):
         return pos.permute(0, 3, 1, 2).contiguous()
 
 
-class PositionEmbedding3D(nn.Module):
-    """
-    PETR 3D Position Embedding.
-
-    Projects 3D reference points to multi-view image features.
-    This is the key innovation of PETR.
-
-    Given camera intrinsics (K) and extrinsics (E), we project 3D points
-    to each view and generate position embeddings.
-    """
-
-    def __init__(self, d_model: int = 256, num_feats: int = 64) -> None:
-        super().__init__()
-        self.d_model = d_model
-        self.num_feats = num_feats
-
-        # MLP to project 3D coordinates to embedding space
-        self.emb_3d = nn.Sequential(
-            nn.Linear(3, num_feats),
-            nn.ReLU(),
-            nn.Linear(num_feats, d_model),
-        )
-
-        # Position embedding for projected 2D coordinates
-        self.pos_2d = nn.Sequential(
-            nn.Linear(2, num_feats),
-            nn.ReLU(),
-            nn.Linear(num_feats, d_model),
-        )
-
-    def forward(
-        self,
-        reference_points: torch.Tensor,  # (B, N, 3) 3D reference points in world coordinates
-        cam_intrinsics: torch.Tensor,    # (B, V, 3, 3) camera intrinsics
-        cam_extrinsics: torch.Tensor,    # (B, V, 4, 4) camera extrinsics (world to cam)
-        feat_h: int,
-        feat_w: int,
-    ) -> torch.Tensor:
-        """
-        Generate 3D position embeddings.
-
-        Args:
-            reference_points: 3D points in world coordinates (B, N, 3)
-            cam_intrinsics: Camera intrinsics matrix K (B, V, 3, 3)
-            cam_extrinsics: Camera extrinsics matrix [R|t] (B, V, 4, 4)
-            feat_h: Feature map height
-            feat_w: Feature map width
-
-        Returns:
-            pos_3d: 3D position embeddings (B, V*H*W, d_model)
-        """
-        B, N, _ = reference_points.shape
-        V = cam_intrinsics.shape[1]
-        device = reference_points.device
-        dtype = reference_points.dtype
-
-        # Generate 2D grid on feature map
-        # (feat_h, feat_w) -> (feat_h * feat_w, 2)
-        grid_y, grid_x = torch.meshgrid(
-            torch.linspace(0.5, feat_h - 0.5, feat_h, device=device, dtype=dtype),
-            torch.linspace(0.5, feat_w - 0.5, feat_w, device=device, dtype=dtype),
-            indexing='ij'
-        )
-        # Scale to image coordinates (assuming feature stride is 8)
-        grid_2d = torch.stack([grid_x, grid_y], dim=-1) * 8  # (H, W, 2)
-        grid_2d = grid_2d.view(-1, 2)  # (H*W, 2)
-
-        # Unproject 2D points to 3D rays for each view
-        # For each view, we create rays from camera center through each pixel
-        pos_3d_list = []
-        for v in range(V):
-            K = cam_intrinsics[:, v]  # (B, 3, 3)
-            E = cam_extrinsics[:, v]  # (B, 4, 4)
-
-            # Get camera pose (world to camera -> camera to world)
-            # E = [R | t] transforms world point to camera frame
-            # To unproject, we need R^T and -R^T @ t
-            R = E[:, :3, :3]  # (B, 3, 3)
-            t = E[:, :3, 3:4]  # (B, 3, 1)
-
-            # Camera center in world coordinates: C = -R^T @ t
-            cam_center = -R.transpose(-1, -2) @ t  # (B, 3, 1)
-
-            # For each pixel, compute ray direction
-            # pixel_uv = grid_2d -> unnormalized image coordinates
-            # Ray in camera frame: K^-1 @ [u, v, 1]^T
-            ones = torch.ones((B, 1), device=device, dtype=dtype)
-            grid_homo = torch.cat([
-                grid_2d[:, 0:1].unsqueeze(0).expand(B, -1, -1),  # u
-                grid_2d[:, 1:2].unsqueeze(0).expand(B, -1, -1),  # v
-                ones.unsqueeze(-1).expand(-1, grid_2d.shape[0], -1),  # 1
-            ], dim=-1)  # (B, H*W, 3)
-
-            K_inv = torch.inverse(K)  # (B, 3, 3)
-            rays_cam = torch.bmm(K_inv, grid_homo.transpose(-1, -2))  # (B, 3, H*W)
-            rays_cam = rays_cam.transpose(-1, -2)  # (B, H*W, 3)
-
-            # Transform rays to world coordinates: R^T @ rays_cam
-            rays_world = torch.bmm(rays_cam, R.transpose(-1, -2))  # (B, H*W, 3)
-            rays_world = F.normalize(rays_world, dim=-1)
-
-            # 3D point at a fixed depth (e.g., depth=1)
-            depth = 1.0
-            points_3d = cam_center.transpose(-1, -2) + rays_world * depth  # (B, H*W, 3)
-
-            # Embed 3D coordinates
-            pos_3d = self.emb_3d(points_3d)  # (B, H*W, d_model)
-            pos_3d_list.append(pos_3d)
-
-        # Concatenate all views: (B, V*H*W, d_model)
-        pos_3d = torch.cat(pos_3d_list, dim=1)
-
-        return pos_3d
-
-
 class SimplePositionEmbedding3D(nn.Module):
     """
     Simplified 3D Position Embedding for training stability.
@@ -612,7 +497,6 @@ class PETR(nn.Module):
         self.input_proj = nn.Conv2d(backbone_channels, d_model, kernel_size=1)
 
         # Position embeddings
-        self.pos_2d = SinCosPositionEmbedding(num_pos_feats=d_model // 2)
         self.pos_3d = SimplePositionEmbedding3D(d_model=d_model, num_views=num_views)
 
         # Transformer encoder
@@ -680,12 +564,8 @@ class PETR(nn.Module):
 
         _, C, h, w = feats.shape
 
-        # Get 2D position embeddings
-        pos_2d = self.pos_2d(feats)  # (B*V, d_model, h, w)
-
         # Reshape for multi-view processing
         feats = feats.view(B, V, C, h, w)
-        pos_2d = pos_2d.view(B, V, C, h, w)
 
         # Get 3D position embeddings
         pos_3d = self.pos_3d(feats)  # (B, V*h*w, d_model)
