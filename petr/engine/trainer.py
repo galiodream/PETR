@@ -5,6 +5,7 @@ Supports both simple direct loss computation and Hungarian matching loss.
 """
 from __future__ import annotations
 
+import time
 from typing import Dict, Iterable, Optional, Tuple
 
 import torch
@@ -12,7 +13,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.cuda.amp import GradScaler, autocast
 
-from petr.utils.distributed import all_reduce_dict, is_main_process
+from petr.utils.distributed import all_reduce_dict, get_world_size, is_main_process
 
 
 def _compute_losses_simple(
@@ -116,8 +117,10 @@ def train_one_epoch(
         Dictionary of average losses
     """
     model.train()
-    running = {"loss": 0.0, "loss_cls": 0.0, "loss_bbox": 0.0, "loss_giou": 0.0}
+    running = {"loss": 0.0, "loss_cls": 0.0, "loss_ce": 0.0, "loss_bbox": 0.0, "loss_giou": 0.0}
     num_steps = 0
+    total_samples = 0.0
+    start_time = time.perf_counter()
 
     for step, batch in enumerate(data_loader):
         images = batch["images"].to(device, non_blocking=True)
@@ -168,6 +171,7 @@ def train_one_epoch(
             optimizer.step()
 
         reduced = all_reduce_dict({k: v.detach() for k, v in loss_dict.items() if k in running})
+        total_samples += float(images.shape[0] * get_world_size())
         for key in running:
             if key in reduced:
                 running[key] += reduced[key].item()
@@ -181,7 +185,12 @@ def train_one_epoch(
                 loss_str += f" giou={reduced['loss_giou']:.4f}"
             print(f"epoch={epoch} step={step} {loss_str}", flush=True)
 
-    return {key: value / max(num_steps, 1) for key, value in running.items()}
+    epoch_time = max(time.perf_counter() - start_time, 1e-8)
+    stats = {key: value / max(num_steps, 1) for key, value in running.items()}
+    stats["epoch_time_sec"] = epoch_time
+    stats["samples_per_sec"] = total_samples / epoch_time
+    stats["steps_per_sec"] = num_steps / epoch_time
+    return stats
 
 
 def evaluate(
@@ -209,8 +218,10 @@ def evaluate(
         Dictionary of average losses
     """
     model.eval()
-    running = {"loss": 0.0, "loss_cls": 0.0, "loss_bbox": 0.0, "loss_giou": 0.0}
+    running = {"loss": 0.0, "loss_cls": 0.0, "loss_ce": 0.0, "loss_bbox": 0.0, "loss_giou": 0.0}
     num_steps = 0
+    total_samples = 0.0
+    start_time = time.perf_counter()
 
     with torch.no_grad():
         for batch in data_loader:
@@ -247,9 +258,15 @@ def evaluate(
                     )
 
             reduced = all_reduce_dict({k: v.detach() for k, v in loss_dict.items() if k in running})
+            total_samples += float(images.shape[0] * get_world_size())
             for key in running:
                 if key in reduced:
                     running[key] += reduced[key].item()
             num_steps += 1
 
-    return {key: value / max(num_steps, 1) for key, value in running.items()}
+    eval_time = max(time.perf_counter() - start_time, 1e-8)
+    stats = {key: value / max(num_steps, 1) for key, value in running.items()}
+    stats["eval_time_sec"] = eval_time
+    stats["samples_per_sec"] = total_samples / eval_time
+    stats["steps_per_sec"] = num_steps / eval_time
+    return stats

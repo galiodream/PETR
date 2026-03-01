@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+from typing import Dict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -14,6 +15,10 @@ if str(PROJECT_ROOT) not in sys.path:
 import torch
 from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:  # pragma: no cover - optional dependency
+    SummaryWriter = None
 
 from petr.config import load_config
 from petr.data import build_dataloaders
@@ -45,6 +50,13 @@ def _resolve_device(device_arg: str, local_rank: int) -> torch.device:
     return torch.device(device_arg)
 
 
+def _to_float_metrics(metrics: Dict[str, float]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for key, value in metrics.items():
+        out[key] = float(value)
+    return out
+
+
 def main() -> None:
     args = parse_args()
     state = init_distributed_mode()
@@ -74,10 +86,15 @@ def main() -> None:
         set_seed(int(cfg["data"]["seed"]) + state.rank)
 
         output_dir = Path(args.output_dir)
+        writer = None
         if is_main_process():
             output_dir.mkdir(parents=True, exist_ok=True)
             with (output_dir / "effective_config.json").open("w", encoding="utf-8") as handle:
                 json.dump(cfg, handle, indent=2)
+            if SummaryWriter is not None:
+                writer = SummaryWriter(log_dir=str(output_dir / "tensorboard"))
+            else:
+                print("TensorBoard is unavailable (missing tensorboard package); skipping TB logging.", flush=True)
 
         train_loader, val_loader, train_sampler = build_dataloaders(cfg, distributed=state.distributed)
 
@@ -149,14 +166,22 @@ def main() -> None:
                 )
 
             if is_main_process():
+                train_float = _to_float_metrics(train_stats)
+                val_float = _to_float_metrics(val_stats)
                 metrics = {
                     "epoch": epoch,
-                    "train": train_stats,
-                    "val": val_stats,
+                    "train": train_float,
+                    "val": val_float,
                 }
                 print(json.dumps(metrics, ensure_ascii=True), flush=True)
                 with (output_dir / "metrics.jsonl").open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(metrics, ensure_ascii=True) + "\n")
+                if writer is not None:
+                    for key, value in train_float.items():
+                        writer.add_scalar(f"train/{key}", value, epoch)
+                    for key, value in val_float.items():
+                        writer.add_scalar(f"val/{key}", value, epoch)
+                    writer.flush()
 
                 should_save = ((epoch + 1) % save_interval == 0) or (epoch + 1 == epochs)
                 if should_save:
@@ -168,6 +193,9 @@ def main() -> None:
                         epoch=epoch,
                         cfg=cfg,
                     )
+
+        if writer is not None:
+            writer.close()
 
     finally:
         cleanup_distributed()
