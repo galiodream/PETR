@@ -17,6 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torchvision.models import resnet50
+from torchvision.ops import FeaturePyramidNetwork
 
 
 class MLP(nn.Module):
@@ -36,24 +38,36 @@ class MLP(nn.Module):
 
 
 class SimpleBackbone(nn.Module):
-    """Simple CNN backbone for feature extraction."""
+    """ResNet50 + FPN backbone for feature extraction."""
 
     def __init__(self, out_channels: int = 128) -> None:
         super().__init__()
-        self.body = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, out_channels, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
+        backbone = resnet50(weights=None)
+        self.stem = nn.Sequential(
+            backbone.conv1,
+            backbone.bn1,
+            backbone.relu,
+            backbone.maxpool,
+        )
+        self.layer1 = backbone.layer1  # C2 (stride=4)
+        self.layer2 = backbone.layer2  # C3 (stride=8)
+        self.layer3 = backbone.layer3  # C4 (stride=16)
+        self.layer4 = backbone.layer4  # C5 (stride=32)
+        self.fpn = FeaturePyramidNetwork(
+            in_channels_list=[256, 512, 1024, 2048],
+            out_channels=out_channels,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.body(x)
+        x = self.stem(x)
+        c2 = self.layer1(x)
+        c3 = self.layer2(c2)
+        c4 = self.layer3(c3)
+        c5 = self.layer4(c4)
+
+        # Keep stride=8 output to match previous token count/compute profile.
+        pyramid_feats = self.fpn({"c2": c2, "c3": c3, "c4": c4, "c5": c5})
+        return pyramid_feats["c3"]
 
 
 class SinCosPositionEmbedding(nn.Module):
