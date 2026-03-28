@@ -18,6 +18,7 @@ CONFIG=${CONFIG:-configs/default.yaml}
 OUTPUT=${OUTPUT:-outputs/infer/predictions.json}
 PYTHON_BIN=${PYTHON_BIN:-python}
 
+# DDP shell scripts
 exec "${PYTHON_BIN}" -m torch.distributed.run \
   --nnodes="${NNODES}" \
   --node_rank="${NODE_RANK}" \
