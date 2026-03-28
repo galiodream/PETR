@@ -79,3 +79,4 @@ This runs:
 2. checkpoint-based inference
 3. pytest unit/integration tests
 4. CPU 2-process `torchrun` DDP smoke
+5. test
